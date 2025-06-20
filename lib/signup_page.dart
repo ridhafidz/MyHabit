@@ -1,107 +1,134 @@
+// file: lib/signup_page.dart
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pocketbase/pocketbase.dart';
 import 'dart:convert';
+import 'database_helper.dart';
+// Pastikan path ke model User sudah benar
+import 'models/user_model.dart'; 
 
-class SignUpPage extends StatefulWidget {
+class SignupPage extends StatefulWidget {
   @override
-  _SignUpPageState createState() => _SignUpPageState();
+  _SignupPageState createState() => _SignupPageState();
 }
 
-class _SignUpPageState extends State<SignUpPage> {
-  final pb = PocketBase('http://127.0.0.1:8090'); // Replace with your PocketBase URL
+class _SignupPageState extends State<SignupPage> {
   final _nameController = TextEditingController();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   bool _agreeToTerms = false;
   String? _errorMessage;
   bool _isPasswordVisible = false;
+  bool _isLoading = false; // State untuk mengelola indikator loading
 
-  Future<void> _signUp(BuildContext context) async {
+  // Fungsi untuk menangani logika pendaftaran
+  Future<void> _signUp() async {
+    if (!mounted) return;
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
     try {
-      // Validate input
+      // Validasi input
       if (_nameController.text.isEmpty ||
           _emailController.text.isEmpty ||
           _passwordController.text.isEmpty) {
-        setState(() {
-          _errorMessage = 'Please fill in all fields';
-        });
-        return;
+        throw Exception('Please fill in all fields');
       }
 
-      if (!_emailController.text.contains('@') || !_emailController.text.contains('.')) {
-        setState(() {
-          _errorMessage = 'Please enter a valid email';
-        });
-        return;
+      if (!_emailController.text.contains('@') ||
+          !_emailController.text.contains('.')) {
+        throw Exception('Please enter a valid email');
       }
 
       if (_passwordController.text.length < 8) {
-        setState(() {
-          _errorMessage = 'Password must be at least 8 characters';
-        });
-        return;
+        throw Exception('Password must be at least 8 characters');
       }
 
       if (!_agreeToTerms) {
-        setState(() {
-          _errorMessage = 'Please agree to terms';
-        });
-        return;
+        throw Exception('You must agree to the terms and conditions');
       }
 
-      // Create a new user in PocketBase
+      // === PERBAIKAN: Hanya mengirim field yang memiliki nilai, sisanya biarkan default di DB ===
       final userData = {
-        'name': _nameController.text,
-        'email': _emailController.text,
+        'name': _nameController.text.trim(),
+        'email': _emailController.text.trim(),
         'password': _passwordController.text,
         'passwordConfirm': _passwordController.text,
         'emailVisibility': true,
+        // Data awal untuk pengguna baru
         'coins': 0,
-        'background': 'default',
-        'purchasedItems': jsonEncode([]),
-        // Removed 'avatar' field; set default in PocketBase schema
+        'level': 1,
+        'xp': 0, 
+        'purchasedItems': [],
+        // Field opsional tidak perlu dikirim jika kosong
       };
 
-      // Create the user in the 'users' collection
-      final record = await pb.collection('users').create(body: userData);
+      print('Attempting to create user with data: $userData');
+      
+      // Membuat record pengguna baru di PocketBase
+      final record = await DatabaseHelper.pb
+          .collection('users')
+          .create(body: userData);
 
-      // Authenticate the user after signup
-      await pb.collection('users').authWithPassword(
-        _emailController.text,
-        _passwordController.text,
-      );
+      print('User created successfully, record ID: ${record.id}');
+      
+      // Langsung login setelah berhasil mendaftar untuk mendapatkan sesi
+      await DatabaseHelper.pb
+          .collection('users')
+          .authWithPassword(_emailController.text.trim(), _passwordController.text);
+      
+      print('User authenticated successfully after signup');
 
-      // Save user data to SharedPreferences
+      // Gunakan User.fromRecord untuk membuat objek dari respons
+      final newUser = User.fromRecord(record);
+
+      // Simpan data user yang sudah rapi ke SharedPreferences
       final prefs = await SharedPreferences.getInstance();
-      final loggedInUser = {
-        'id': record.id,
-        'name': record.data['name'],
-        'email': record.data['email'],
-        'coins': record.data['coins'],
-        'avatar': record.data['avatar'] ?? 'default', // Fallback if not set
-        'background': record.data['background'],
-        'purchasedItems': record.data['purchasedItems'],
-      };
-      await prefs.setString('currentUser', jsonEncode(loggedInUser));
+      await prefs.setString('currentUser', jsonEncode(newUser.toMap()));
+      print('New user data saved to SharedPreferences: ${jsonEncode(newUser.toMap())}');
+      
+      if (mounted) {
+        Navigator.pushReplacementNamed(context, '/dashboard');
+      }
 
-      // Navigate to dashboard
-      Navigator.pushReplacementNamed(context, '/dashboard');
-    } catch (e) {
-      // Enhanced error handling
-      String errorMessage = 'Error during signup';
-      if (e is ClientException) {
-        errorMessage = 'Failed to create user: ${e.toString()}';
-        errorMessage += '\nDetails: ${jsonEncode(e.response)}';
-        print('ClientException: $e'); // Log to console for debugging
-      } else {
-        errorMessage = 'Unexpected error: $e';
-        print('Error: $e'); // Log to console for debugging
+    } on ClientException catch (e) {
+      print('ClientException: ${jsonEncode(e.response)}');
+      String serverMessage = 'An error occurred.';
+      if (e.response.containsKey('data') && e.response['data'] is Map && e.response['data'].isNotEmpty) {
+        final data = e.response['data'] as Map;
+        // Mencari pesan error spesifik dari field yang gagal validasi
+        final fieldError = data.values.firstWhere((v) => v is Map && v.containsKey('message'), orElse: () => null);
+        if (fieldError != null) {
+          serverMessage = fieldError['message'] as String;
+        } else {
+           serverMessage = e.response['message'] ?? 'Gagal membuat akun.';
+        }
+      } else if (e.response.containsKey('message')) {
+        serverMessage = e.response['message'] as String;
       }
       setState(() {
-        _errorMessage = errorMessage;
+        _errorMessage = serverMessage;
       });
+    } catch (e) {
+      print('Unexpected error: $e');
+      setState(() {
+        _errorMessage = e.toString().replaceAll("Exception: ", "");
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
     }
+  }
+  
+  void _navigateToLogin() {
+    Navigator.pop(context);
   }
 
   @override
@@ -116,116 +143,147 @@ class _SignUpPageState extends State<SignUpPage> {
           ),
         ),
         child: Center(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  'Sign Up',
-                  style: Theme.of(context).textTheme.headlineLarge,
-                ),
-                SizedBox(height: 32),
-                TextField(
-                  controller: _nameController,
-                  decoration: InputDecoration(
-                    filled: true,
-                    fillColor: Colors.white,
-                    hintText: 'Name',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide.none,
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32.0),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    'Create Account',
+                    style: TextStyle(
+                      fontSize: 32, 
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
                     ),
                   ),
-                ),
-                SizedBox(height: 16),
-                TextField(
-                  controller: _emailController,
-                  decoration: InputDecoration(
-                    filled: true,
-                    fillColor: Colors.white,
-                    hintText: 'Email',
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide.none,
-                    ),
-                  ),
-                ),
-                SizedBox(height: 16),
-                TextField(
-                  controller: _passwordController,
-                  obscureText: !_isPasswordVisible,
-                  decoration: InputDecoration(
-                    filled: true,
-                    fillColor: Colors.white,
-                    hintText: 'Password',
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _isPasswordVisible ? Icons.visibility : Icons.visibility_off,
-                        color: Colors.grey,
+                  SizedBox(height: 32),
+                  TextField(
+                    controller: _nameController,
+                    decoration: InputDecoration(
+                      filled: true,
+                      fillColor: Colors.white.withOpacity(0.2),
+                      hintText: 'Name',
+                      hintStyle: TextStyle(color: Colors.white70),
+                      prefixIcon: Icon(Icons.person_outline, color: Colors.white),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _isPasswordVisible = !_isPasswordVisible;
-                        });
-                      },
                     ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide.none,
-                    ),
+                    style: TextStyle(color: Colors.white),
                   ),
-                ),
-                SizedBox(height: 16),
-                Row(
-                  children: [
-                    Checkbox(
-                      value: _agreeToTerms,
-                      onChanged: (value) {
-                        setState(() {
-                          _agreeToTerms = value ?? false;
-                        });
-                      },
-                      fillColor: MaterialStateProperty.all(Colors.white),
-                      checkColor: Colors.purple,
-                    ),
-                    Expanded(
-                      child: Text(
-                        'I agree to receive promotional materials and offers',
-                        style: TextStyle(color: Colors.white70),
+                  SizedBox(height: 16),
+                  TextField(
+                    controller: _emailController,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: InputDecoration(
+                      filled: true,
+                      fillColor: Colors.white.withOpacity(0.2),
+                      hintText: 'Email',
+                      hintStyle: TextStyle(color: Colors.white70),
+                      prefixIcon: Icon(Icons.email_outlined, color: Colors.white),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
                       ),
+                    ),
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  SizedBox(height: 16),
+                  TextField(
+                    controller: _passwordController,
+                    obscureText: !_isPasswordVisible,
+                    decoration: InputDecoration(
+                      filled: true,
+                      fillColor: Colors.white.withOpacity(0.2),
+                      hintText: 'Password (min. 8 characters)',
+                      hintStyle: TextStyle(color: Colors.white70),
+                      prefixIcon: Icon(Icons.lock_outline, color: Colors.white),
+                      suffixIcon: IconButton(
+                        icon: Icon(
+                          _isPasswordVisible
+                              ? Icons.visibility
+                              : Icons.visibility_off,
+                          color: Colors.white70,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _isPasswordVisible = !_isPasswordVisible;
+                          });
+                        },
+                      ),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Checkbox(
+                        value: _agreeToTerms,
+                        onChanged: (value) {
+                          setState(() {
+                            _agreeToTerms = value ?? false;
+                          });
+                        },
+                        fillColor: MaterialStateProperty.all(Colors.white),
+                        checkColor: Colors.deepPurple,
+                      ),
+                      Expanded(
+                        child: Text(
+                          'I agree to the Terms and Conditions',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_errorMessage != null) ...[
+                    SizedBox(height: 16),
+                    Text(
+                      _errorMessage!,
+                      style: TextStyle(color: Colors.redAccent[100], fontSize: 14),
+                      textAlign: TextAlign.center,
                     ),
                   ],
-                ),
-                if (_errorMessage != null) ...[
                   SizedBox(height: 16),
-                  Text(
-                    _errorMessage!,
-                    style: TextStyle(color: Colors.redAccent),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: ElevatedButton(
+                      onPressed: _isLoading ? null : _signUp,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Color(0xFFFFFFFF),
+                        disabledBackgroundColor: Colors.grey.withOpacity(0.5),
+                        foregroundColor: Color(0xFF4B0082),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      child: _isLoading
+                          ? CircularProgressIndicator(color: Color(0xFF4B0082), strokeWidth: 3,)
+                          : Text('Sign Up', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    ),
                   ),
+                  SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text("Already have an account?", style: TextStyle(color: Colors.white70)),
+                      TextButton(
+                        onPressed: _isLoading ? null : _navigateToLogin,
+                        child: Text(
+                          'Log In',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ],
+                  )
                 ],
-                SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: () => _signUp(context),
-                  style: ElevatedButton.styleFrom(
-                    minimumSize: Size(double.infinity, 50),
-                  ),
-                  child: Text(
-                    'Sign Up',
-                    style: TextStyle(fontSize: 18),
-                  ),
-                ),
-                SizedBox(height: 16),
-                TextButton(
-                  onPressed: () {
-                    Navigator.pushNamed(context, '/login');
-                  },
-                  child: Text(
-                    'Log In',
-                    style: TextStyle(color: Colors.white70),
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
         ),
